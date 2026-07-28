@@ -1,238 +1,202 @@
-import argparse
-import logging
 import os
-import random
-import sys
+import time
+import argparse
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
-from pathlib import Path
 from torch import optim
-from torch.utils.data import DataLoader, random_split
-from tqdm import tqdm
 
-import wandb
-from evaluate import evaluate
-from unet import UNet
-from utils.data_loading import BasicDataset, CarvanaDataset
-from utils.dice_score import dice_loss
-
-dir_img = Path('./data/imgs/')
-dir_mask = Path('./data/masks/')
-dir_checkpoint = Path('./checkpoints/')
+# 导入你的数据加载器和模型
+# 注意：确保这里导入路径与你的工程目录结构一致
+from dataprovider.data_factory import data_provider
+from unet.model import MultiPeriodUNetInpainter
 
 
-def train_model(
-        model,
-        device,
-        epochs: int = 5,
-        batch_size: int = 1,
-        learning_rate: float = 1e-5,
-        val_percent: float = 0.1,
-        save_checkpoint: bool = True,
-        img_scale: float = 0.5,
-        amp: bool = False,
-        weight_decay: float = 1e-8,
-        momentum: float = 0.999,
-        gradient_clipping: float = 1.0,
-):
-    # 1. Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+# ==========================================
+# 1. 实用工具：早停机制 (Early Stopping)
+# ==========================================
+class EarlyStopping:
+    def __init__(self, patience=7, verbose=False, delta=0, save_path='checkpoint.pth'):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
+        self.delta = delta
+        self.save_path = save_path
 
-    # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping 计数: {self.counter} / {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
 
-    # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
-    train_loader = DataLoader(train_set, shuffle=True, **loader_args)
-    val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
+    def save_checkpoint(self, val_loss, model):
+        if self.verbose:
+            print(f'验证集 Loss 下降 ({self.val_loss_min:.6f} --> {val_loss:.6f}). 保存模型...')
+        torch.save(model.state_dict(), self.save_path)
+        self.val_loss_min = val_loss
 
-    # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
-    experiment.config.update(
-        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
-    )
+def train_and_evaluate(args):
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"正在使用计算设备: {device}")
 
-    logging.info(f'''Starting training:
-        Epochs:          {epochs}
-        Batch size:      {batch_size}
-        Learning rate:   {learning_rate}
-        Training size:   {n_train}
-        Validation size: {n_val}
-        Checkpoints:     {save_checkpoint}
-        Device:          {device.type}
-        Images scaling:  {img_scale}
-        Mixed Precision: {amp}
-    ''')
+    # 1. 先获取数据加载器
+    train_data, train_loader = data_provider(args, flag='train')
+    val_data, val_loader = data_provider(args, flag='val')
+    test_data, test_loader = data_provider(args, flag='test')
 
-    # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
-    global_step = 0
+    # 2. 然后打印统计量（此时加载器已存在）
+    train_batch = next(iter(train_loader))[0]  # batch_x
+    val_batch = next(iter(val_loader))[0]
+    print(f"训练集 batch 均值: {train_batch.mean().item():.4f}, 标准差: {train_batch.std().item():.4f}")
+    print(f"验证集 batch 均值: {val_batch.mean().item():.4f}, 标准差: {val_batch.std().item():.4f}")
 
-    # 5. Begin training
-    for epoch in range(1, epochs + 1):
+
+
+    model = MultiPeriodUNetInpainter(num_vars=args.enc_in, top_k=args.top_k).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    criterion = nn.MSELoss()
+
+    os.makedirs(args.checkpoints, exist_ok=True)
+    model_save_path = os.path.join(args.checkpoints, 'unet_inpainter_best.pth')
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True, save_path=model_save_path)
+
+    for epoch in range(args.train_epochs):
+        # -------------------- 训练 --------------------
         model.train()
-        epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
-            for batch in train_loader:
-                images, true_masks = batch['image'], batch['mask']
+        train_loss = []
+        epoch_start_time = time.time()
 
-                assert images.shape[1] == model.n_channels, \
-                    f'Network has been defined with {model.n_channels} input channels, ' \
-                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
+        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+            optimizer.zero_grad()
+            batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)
 
-                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+            B, seq_len, C = batch_x.shape
+            # batch_y 的形状为 [B, label_len + pred_len, C]
+            label_len = args.label_len
+            pred_len = args.pred_len
 
-                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                    masks_pred = model(images)
-                    if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
-                    else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
-                            F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
-                            multiclass=True
-                        )
+            # 修正点1：将历史、已知未来段、待预测未来段拼接成完整序列
+            # 注意：batch_y 的前 label_len 是已知的未来段，后 pred_len 是待预测目标
+            true_total_seq = torch.cat([batch_x, batch_y], dim=1)  # [B, seq_len+label_len+pred_len, C]
 
-                optimizer.zero_grad(set_to_none=True)
-                grad_scaler.scale(loss).backward()
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+            # 修正点2：生成正确的掩码，已知部分（历史 + label段）为1，待预测段为0
+            mask = torch.ones_like(true_total_seq)
+            mask[:, seq_len + label_len:, :] = 0   # 只有最后 pred_len 位置为0（待预测）
 
-                pbar.update(images.shape[0])
-                global_step += 1
-                epoch_loss += loss.item()
-                experiment.log({
-                    'train loss': loss.item(),
-                    'step': global_step,
-                    'epoch': epoch
-                })
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
+            predicted_total_seq = model(true_total_seq, mask)
 
-                # Evaluation round
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        histograms = {}
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                histograms['Weights/' + tag] = wandb.Histogram(value.data.cpu())
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                histograms['Gradients/' + tag] = wandb.Histogram(value.grad.data.cpu())
+            # 损失只计算最后 pred_len 部分
+            future_pred = predicted_total_seq[:, -pred_len:, :]
+            future_y = batch_y[:, -pred_len:, :]   # 与 future_pred 对齐
+            loss = criterion(future_pred, future_y)
+            train_loss.append(loss.item())
 
-                        val_score = evaluate(model, val_loader, device, amp)
-                        scheduler.step(val_score)
+            loss.backward()
+            optimizer.step()
 
-                        logging.info('Validation Dice score: {}'.format(val_score))
-                        try:
-                            experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                                },
-                                'step': global_step,
-                                'epoch': epoch,
-                                **histograms
-                            })
-                        except:
-                            pass
+            if (i + 1) % 100 == 0:
+                print(f"\t迭代: {i + 1}, Epoch: {epoch + 1} | 训练 Loss: {loss.item():.7f}")
 
-        if save_checkpoint:
-            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            state_dict = model.state_dict()
-            state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
-            logging.info(f'Checkpoint {epoch} saved!')
+        train_loss_avg = np.average(train_loss)
+        print(f"Epoch: {epoch + 1} 训练耗时: {time.time() - epoch_start_time:.2f}s")
 
+        # -------------------- 验证 --------------------
+        model.eval()
+        val_loss = []
+        model.eval()
+        val_loss, val_mae, val_rmse = [], [], []
+        with torch.no_grad():
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in val_loader:
+                batch_x = batch_x.float().to(device)
+                batch_y = batch_y.float().to(device)
+                B, seq_len, C = batch_x.shape
+                label_len, pred_len = args.label_len, args.pred_len
 
-def get_args():
-    parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
-    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
-                        help='Learning rate', dest='lr')
-    parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
-    parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
-    parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
-                        help='Percent of the data that is used as validation (0-100)')
-    parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
-    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+                true_total_seq = torch.cat([batch_x, batch_y], dim=1)
+                mask = torch.ones_like(true_total_seq)
+                mask[:, seq_len + label_len:, :] = 0
 
-    return parser.parse_args()
+                predicted_total_seq = model(true_total_seq, mask)
+                future_pred = predicted_total_seq[:, -pred_len:, :]
+                future_y = batch_y[:, -pred_len:, :]
 
+                mse = criterion(future_pred, future_y).item()
+                mae = torch.mean(torch.abs(future_pred - future_y)).item()
+                rmse = torch.sqrt(torch.mean((future_pred - future_y) ** 2)).item()
 
+                val_loss.append(mse)
+                val_mae.append(mae)
+                val_rmse.append(rmse)
+
+        val_loss_avg = np.average(val_loss)
+        val_mae_avg = np.average(val_mae)
+        val_rmse_avg = np.average(val_rmse)
+
+        print(f"Epoch: {epoch + 1} | 验证 MSE: {val_loss_avg:.7f} | MAE: {val_mae_avg:.7f} | RMSE: {val_rmse_avg:.7f}")
+        early_stopping(val_loss_avg, model)
+        if early_stopping.early_stop:
+            print("连续多次验证集 Loss 未下降，触发早停机制，停止训练。")
+            break
+
+    model.load_state_dict(torch.load(model_save_path))
+    return model
+
+# ==========================================
+# 3. 主函数与命令行参数配置
+# ==========================================
 if __name__ == '__main__':
-    args = get_args()
+    parser = argparse.ArgumentParser(description='2D U-Net Masked Reconstruction for Time Series')
 
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Using device {device}')
+    # 基础配置
+    parser.add_argument('--task_name', type=str, default='long_term_forecast')
+    parser.add_argument('--data', type=str, default='ETTh1', help='dataset type')
+    parser.add_argument('--root_path', type=str, default='./dataset/ETT-small/', help='数据集存放文件夹')
+    parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='数据文件名称')
+    parser.add_argument('--features', type=str, default='M', help='预测任务 M:多变量预测多变量')
+    parser.add_argument('--target', type=str, default='OT', help='目标列 (单变量预测时使用)')
+    parser.add_argument('--freq', type=str, default='h', help='时间特征编码的频率')
+    parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='模型权重保存路径')
+    parser.add_argument('--embed', type=str, default='timeF', help='时间特征编码方式')
 
-    # Change here to adapt to your data
-    # n_channels=3 for RGB images
-    # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
-    model = model.to(memory_format=torch.channels_last)
+    # 序列长度与维度参数
+    parser.add_argument('--seq_len', type=int, default=96, help='历史序列长度 (如过去96小时)')
+    parser.add_argument('--label_len', type=int, default=48, help='提供给解码器的引导长度 (对于我们的重建任务不敏感)')
+    parser.add_argument('--pred_len', type=int, default=96, help='要预测的未来长度')
+    parser.add_argument('--enc_in', type=int, default=7, help='变量数/特征数 (ETTh1为7)')
 
-    logging.info(f'Network:\n'
-                 f'\t{model.n_channels} input channels\n'
-                 f'\t{model.n_classes} output channels (classes)\n'
-                 f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
+    # 针对 U-Net 的定制参数
+    # 考虑到你使用的是 12GB 显存，top_k 建议设为 1 或 2，batch_size 设为 16
+    parser.add_argument('--top_k', type=int, default=2, help='FFT 选取的显著周期分支数')
 
-    if args.load:
-        state_dict = torch.load(args.load, map_location=device)
-        del state_dict['mask_values']
-        model.load_state_dict(state_dict)
-        logging.info(f'Model loaded from {args.load}')
+    # 训练配置
+    parser.add_argument('--num_workers', type=int, default=0, help='DataLoader 线程数 (Windows建议设0)')
+    parser.add_argument('--train_epochs', type=int, default=10, help='训练总轮数')
+    parser.add_argument('--batch_size', type=int, default=16, help='批次大小')
+    parser.add_argument('--patience', type=int, default=3, help='早停容忍的轮数')
+    parser.add_argument('--learning_rate', type=float, default=0.0001, help='学习率')
 
-    model.to(device=device)
-    try:
-        train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp
-        )
-    except torch.cuda.OutOfMemoryError:
-        logging.error('Detected OutOfMemoryError! '
-                      'Enabling checkpointing to reduce memory usage, but this slows down training. '
-                      'Consider enabling AMP (--amp) for fast and memory efficient training')
-        torch.cuda.empty_cache()
-        model.use_checkpointing()
-        train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp
-        )
+    # 冗余参数 (为了兼容官方 data_provider 中存在的调用)
+    parser.add_argument('--seasonal_patterns', type=str, default='Monthly', help='subset for M4')
+
+    args = parser.parse_args()
+
+    print('实验参数配置:')
+    print(args)
+
+    # 启动训练
+    trained_model = train_and_evaluate(args)
+    print("训练及验证全流程执行完毕！")
