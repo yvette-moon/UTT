@@ -61,8 +61,17 @@ def train_and_evaluate(args):
     # args.enc_in 就是特征/传感器的数量 (ETT 默认为 7)
     model = MultiPeriodUNetInpainter(num_vars=args.enc_in, top_k=args.top_k).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    # ===== 优化器 + 损失 + 调度器 =====
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     criterion = nn.MSELoss()
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=2,
+        min_lr=1e-6
+    )
 
     os.makedirs(args.checkpoints, exist_ok=True)
     model_save_path = os.path.join(args.checkpoints, 'unet_inpainter_best.pth')
@@ -114,37 +123,40 @@ def train_and_evaluate(args):
         # -------------------------
         # 验证阶段
         # -------------------------
+        # -------------------- 验证 --------------------
         model.eval()
         val_loss = []
+
         with torch.no_grad():
             for batch_x, batch_y, batch_x_mark, batch_y_mark in val_loader:
                 batch_x = batch_x.float().to(device)
                 batch_y = batch_y.float().to(device)
-
                 B, seq_len, C = batch_x.shape
-                pred_len = batch_y.shape[1] - args.label_len
+                pred_len = args.pred_len
 
                 future_y = batch_y[:, -pred_len:, :]
-                true_total_seq = torch.cat([batch_x, future_y], dim=1)
+                future_placeholder = torch.zeros_like(future_y)
+                model_input = torch.cat([batch_x, future_placeholder], dim=1)
 
-                mask = torch.ones_like(true_total_seq).to(device)
+                mask = torch.ones_like(model_input)
                 mask[:, seq_len:, :] = 0
 
-                predicted_total_seq = model(true_total_seq, mask)
+                predicted_total_seq = model(model_input, mask)
                 future_pred = predicted_total_seq[:, -pred_len:, :]
 
-                loss = criterion(future_pred, future_y)
-                val_loss.append(loss.item())
+                mse = criterion(future_pred, future_y).item()
+                val_loss.append(mse)
 
         val_loss_avg = np.average(val_loss)
-        print(f"Epoch: {epoch + 1} | 训练集 Loss: {train_loss_avg:.7f} | 验证集 Loss: {val_loss_avg:.7f}")
+        print(f"Epoch: {epoch + 1} | 验证 MSE: {val_loss_avg:.7f}")
 
-        # 早停判断
+        scheduler.step(val_loss_avg)
+        print(f"当前学习率: {optimizer.param_groups[0]['lr']:.6e}")
+
         early_stopping(val_loss_avg, model)
         if early_stopping.early_stop:
-            print("触发早停机制，停止训练。")
+            print("连续多次验证集 Loss 未下降，触发早停机制，停止训练。")
             break
-
     # 加载表现最好的模型权重
     model.load_state_dict(torch.load(model_save_path))
     return model
@@ -180,7 +192,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=0, help='dataset loader num workers')
     parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
     parser.add_argument('--batch_size', type=int, default=16, help='batch size of train input dataset')
-    parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
+    parser.add_argument('--patience', type=int, default=8, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
 
     # 其他冗余参数 (为了兼容官方 data_provider 不报错)

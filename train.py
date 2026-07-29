@@ -91,17 +91,25 @@ def train_and_evaluate(args):
 
             # 修正点1：将历史、已知未来段、待预测未来段拼接成完整序列
             # 注意：batch_y 的前 label_len 是已知的未来段，后 pred_len 是待预测目标
-            true_total_seq = torch.cat([batch_x, batch_y], dim=1)  # [B, seq_len+label_len+pred_len, C]
+            # ===== 原逻辑（删除）=====
+            # true_total_seq = torch.cat([batch_x, batch_y], dim=1)
+            # mask = torch.ones_like(true_total_seq)
+            # mask[:, seq_len + label_len:, :] = 0
+            # predicted_total_seq = model(true_total_seq, mask)
+            # future_pred = predicted_total_seq[:, -pred_len:, :]
+            # future_y = batch_y[:, -pred_len:, :]
 
-            # 修正点2：生成正确的掩码，已知部分（历史 + label段）为1，待预测段为0
-            mask = torch.ones_like(true_total_seq)
-            mask[:, seq_len + label_len:, :] = 0   # 只有最后 pred_len 位置为0（待预测）
+            # ===== 新逻辑（替换）=====
+            future_y = batch_y[:, -pred_len:, :]  # 监督目标
+            future_placeholder = torch.zeros_like(future_y)  # 不喂未来真值
+            model_input = torch.cat([batch_x, future_placeholder], dim=1)  # [B, seq_len+pred_len, C]
 
-            predicted_total_seq = model(true_total_seq, mask)
+            mask = torch.ones_like(model_input)
+            mask[:, seq_len:, :] = 0  # 未来区域全遮罩
 
-            # 损失只计算最后 pred_len 部分
+            predicted_total_seq = model(model_input, mask)
             future_pred = predicted_total_seq[:, -pred_len:, :]
-            future_y = batch_y[:, -pred_len:, :]   # 与 future_pred 对齐
+
             loss = criterion(future_pred, future_y)
             train_loss.append(loss.item())
 
@@ -126,13 +134,15 @@ def train_and_evaluate(args):
                 B, seq_len, C = batch_x.shape
                 label_len, pred_len = args.label_len, args.pred_len
 
-                true_total_seq = torch.cat([batch_x, batch_y], dim=1)
-                mask = torch.ones_like(true_total_seq)
-                mask[:, seq_len + label_len:, :] = 0
+                future_y = batch_y[:, -pred_len:, :]  # 监督目标
+                future_placeholder = torch.zeros_like(future_y)  # 不喂未来真值
+                model_input = torch.cat([batch_x, future_placeholder], dim=1)  # [B, seq_len+pred_len, C]
 
-                predicted_total_seq = model(true_total_seq, mask)
+                mask = torch.ones_like(model_input)
+                mask[:, seq_len:, :] = 0  # 未来区域全遮罩
+
+                predicted_total_seq = model(model_input, mask)
                 future_pred = predicted_total_seq[:, -pred_len:, :]
-                future_y = batch_y[:, -pred_len:, :]
 
                 mse = criterion(future_pred, future_y).item()
                 mae = torch.mean(torch.abs(future_pred - future_y)).item()
